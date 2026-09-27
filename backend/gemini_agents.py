@@ -67,6 +67,9 @@ def analyze_incident(incident: dict[str, Any], outputs: list[dict[str, Any]]) ->
     except urllib.error.HTTPError as exc:
         return {"status": "UNAVAILABLE", "mode": "LOCAL_FALLBACK", "provider": "Gemini", "model": model,
                 "reason": f"Gemini API returned HTTP {exc.code}"}
+    except RuntimeError:
+        return {"status": "UNAVAILABLE", "mode": "LOCAL_FALLBACK", "provider": "Gemini", "model": model,
+                "reason": "Gemini returned an unusable advisory; deterministic plan retained"}
     except Exception as exc:
         # Never put request headers, API key, or provider response body in application state.
         reason = f"Gemini analysis failed ({type(exc).__name__})"

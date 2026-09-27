@@ -1,0 +1,32 @@
+services:
+  - type: web
+    name: kavach-api
+    runtime: python
+    plan: free
+    rootDir: backend
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
+    healthCheckPath: /health
+    envVars:
+      - key: KAVACH_DEMO_MODE
+        value: "true"
+      - key: KAVACH_EMAIL_ENABLED
+        value: "false"
+      - key: KAVACH_ALLOWED_ORIGINS
+        value: https://kavach-web.onrender.com
+      - key: GEMINI_API_KEY
+        sync: false
+
+  - type: web
+    name: kavach-web
+    runtime: static
+    plan: free
+    buildCommand: npm ci --prefix frontend && npm run build --prefix frontend
+    staticPublishPath: frontend/dist
+    envVars:
+      - key: VITE_API_URL
+        value: https://kavach-api.onrender.com
+    routes:
+      - type: rewrite
+        source: /*
+        destination: /index.html

@@ -1,6 +1,8 @@
 import type { EmergencyFacility, ViewState } from '../types';
 
-export const API_URL = import.meta.env.VITE_API_URL || 'http://127.0.0.1:8000';
+// Empty means same-origin API requests; Vite proxies these in local development.
+// Production can set VITE_API_URL to the Render API service URL at build time.
+export const API_URL = import.meta.env.VITE_API_URL ?? '';
 
 export const INITIAL_VIEW_STATE: ViewState = {
   longitude: 77.6450,

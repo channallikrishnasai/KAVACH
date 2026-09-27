@@ -89,9 +89,10 @@ app = FastAPI(
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[origin.strip() for origin in os.getenv("KAVACH_ALLOWED_ORIGINS", "http://127.0.0.1:5173,http://localhost:5173").split(",") if origin.strip()],
+    allow_origins=[origin.strip() for origin in os.getenv("KAVACH_ALLOWED_ORIGINS", "http://127.0.0.1:5173,http://localhost:5173,http://127.0.0.1:5174,http://localhost:5174,http://127.0.0.1:5175,http://localhost:5175").split(",") if origin.strip()],
     allow_methods=["*"],
     allow_headers=["*"],
+    allow_private_network=True,
 )
 
 # ── STGCN Digital Twin routes (from api.py) ──
