@@ -1,0 +1,556 @@
+import os
+from dotenv import load_dotenv
+load_dotenv()
+os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
+
+from fastapi import FastAPI, APIRouter, Request
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse
+import torch
+import networkx as nx
+import osmnx as ox
+from train import FloodSurrogateModel, get_batched_edge_index
+from pydantic import BaseModel
+import numpy as np
+import json
+import urllib.request
+import uuid
+from datetime import datetime, timezone
+from providers import fetch_government_resource, provider_catalog, provider_status, _weather_provider
+from providers_v3 import provider_status_rows
+
+app = FastAPI(title="Crisis-Flow Digital Twin API")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+T = 12
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+
+print("Loading Graph...")
+G = ox.load_graphml(os.path.join(BASE_DIR, "kc_valley_focused.graphml"))
+nodes = list(G.nodes())
+num_nodes = len(nodes)
+
+print("Loading Static Features and Model...")
+STGCN_STATUS = "simulation"
+model = None
+edge_index = None
+b_edge = None
+static_elev = static_runoff = static_flow_acc = None
+try:
+    dataset_path = os.path.join(BASE_DIR, "val_dataset.pt")
+    weights_path = os.path.join(BASE_DIR, "stgcn_weights.pth")
+    if not os.path.isfile(dataset_path):
+        raise FileNotFoundError(f"STGCN input artifact is missing: {dataset_path}")
+    if not os.path.isfile(weights_path):
+        raise FileNotFoundError(f"STGCN weights are missing: {weights_path}")
+
+    startup_data = torch.load(dataset_path, map_location="cpu", weights_only=False)
+    X_sample = startup_data["X"][0]
+    edge_index = startup_data["edge_index"].to(DEVICE)
+    static_elev = X_sample[:, 0, 0].to(DEVICE)
+    static_runoff = X_sample[:, 0, 4].to(DEVICE)
+    static_flow_acc = X_sample[:, 0, 5].to(DEVICE)
+    model = FloodSurrogateModel(num_nodes=num_nodes, hidden_dim=64).to(DEVICE)
+    model.load_state_dict(torch.load(weights_path, map_location=DEVICE))
+    model.eval()
+    b_edge = get_batched_edge_index(edge_index, num_nodes, 1, DEVICE)
+    STGCN_STATUS = "available"
+    print("STGCN loaded from its original dataset and weights.")
+except Exception as exc:
+    # The original model remains in the project, but the deterministic demo can
+    # still start without claiming to run an unavailable neural network.
+    print(f"STGCN unavailable; using simulation prediction provider. Details: {exc}")
+node_to_idx = {node: i for i, node in enumerate(nodes)}
+
+ZONES_MAPPING = [
+    {"id": "zone-bellandur", "lat": 12.9250, "lng": 77.6680},
+    {"id": "zone-sarjapur", "lat": 12.9100, "lng": 77.6740},
+    {"id": "zone-hsr", "lat": 12.9180, "lng": 77.6440},
+    {"id": "zone-koramangala", "lat": 12.9350, "lng": 77.6200},
+    {"id": "zone-silkboard", "lat": 12.9170, "lng": 77.6230},
+]
+
+# All STGCN routes on a router so main.py can also include them
+stgcn_router = APIRouter(tags=["STGCN Digital Twin"])
+
+class StormRequest(BaseModel):
+    intensity: float
+
+class RouteRequest(BaseModel):
+    start_lat: float
+    start_lon: float
+    end_lat: float
+    end_lon: float
+    intensity: float
+
+class BarricadeRequest(BaseModel):
+    lat: float
+    lon: float
+    road_name: str = "Manual Barricade"
+    reason: str = "Police Intervention"
+
+@stgcn_router.post("/barricade")
+async def create_barricade(req: BarricadeRequest):
+    nearest_node = ox.distance.nearest_nodes(G, req.lon, req.lat)
+    node_data = G.nodes[nearest_node]
+    
+    import database
+    import uuid
+    from datetime import datetime, timezone
+    
+    block_id = f"BLOCK-{uuid.uuid4().hex[:6].upper()}"
+    doc = {
+        "block_id": block_id,
+        "road_name": req.road_name,
+        "zone_id": "manual",
+        "reason": req.reason,
+        "lat": float(node_data['y']),
+        "lon": float(node_data['x']),
+        "node_id": int(nearest_node),
+        "depth_at_block": 0.0,
+        "blocked_by": "police",
+        "status": "active",
+        "blocked_at": datetime.now(timezone.utc),
+        "deleted_at": None
+    }
+    
+    if database.db is not None:
+        await database.db.road_blocks.insert_one(doc)
+    
+    return {"status": "success", "block_id": block_id, "node_id": int(nearest_node)}
+
+@stgcn_router.get("/geojson/buildings")
+def get_buildings():
+    return FileResponse(os.path.join(BASE_DIR, "kc_valley_buildings.geojson"), media_type="application/json")
+
+@stgcn_router.get("/geojson/water")
+def get_water():
+    return FileResponse(os.path.join(BASE_DIR, "kc_valley_water.geojson"), media_type="application/json")
+
+@stgcn_router.post("/simulate")
+async def simulate_storm(req: StormRequest):
+    intensity = max(0.0, min(float(req.intensity), 1.0))
+    if model is not None:
+        X_new = torch.zeros((1, num_nodes, T, 6), device=DEVICE)
+        envelope = torch.exp(-0.5 * ((torch.arange(T, device=DEVICE) - T/2) / 2.0)**2)
+        for t in range(T):
+            X_new[0, :, t, 0] = static_elev
+            X_new[0, :, t, 1] = intensity * envelope[t]
+            X_new[0, :, t, 2] = (intensity * envelope[:t+1].sum()) / 12.0
+            X_new[0, :, t, 3] = min(t / float(T), 1.0)
+            X_new[0, :, t, 4] = static_runoff
+            X_new[0, :, t, 5] = static_flow_acc
+        with torch.no_grad():
+            preds = model(X_new, b_edge)
+        all_depths = preds[0].cpu().numpy()
+        provider = "STGCN"
+        data_state = "MODEL"
+    else:
+        # Clearly labeled deterministic fallback. It uses the bundled graph's
+        # static elevations/runoff and does not pretend to be neural inference.
+        elevation = np.asarray([float(G.nodes[n].get("elevation", 0.0)) for n in nodes], dtype=np.float32)
+        runoff = np.asarray([float(G.nodes[n].get("runoff_coeff", 0.65)) for n in nodes], dtype=np.float32)
+        elevation_span = float(elevation.max() - elevation.min()) if len(elevation) else 0.0
+        low_terrain = np.zeros_like(elevation) if elevation_span == 0 else 1.0 - (elevation - elevation.min()) / elevation_span
+        degree = np.asarray([G.degree(n) for n in nodes], dtype=np.float32)
+        flow_factor = degree / max(float(degree.max()), 1.0)
+        envelope = np.exp(-0.5 * ((np.arange(T, dtype=np.float32) - T / 2) / 2.0) ** 2)
+        terrain_factor = 0.25 + 0.75 * low_terrain
+        surface_factor = 0.75 + 0.5 * np.clip(runoff, 0.0, 1.0) + 0.15 * flow_factor
+        all_depths = (intensity * 4.0 * terrain_factor * surface_factor)[:, None] * envelope[None, :]
+        provider = "SIMULATION"
+        data_state = "SIMULATED"
+
+    if req.intensity <= 0.05:
+        all_depths.fill(0.0)
+
+    max_depths = all_depths.max(axis=1)
+    node_depths = {nodes[i]: float(max_depths[i]) for i in range(num_nodes)}
+
+    # Update MongoDB zones with new simulation depths
+    import database
+    if database.db is not None:
+        for z in ZONES_MAPPING:
+            nearest_node = ox.distance.nearest_nodes(G, z["lng"], z["lat"])
+            idx = node_to_idx.get(nearest_node)
+            if idx is not None:
+                depth = float(max_depths[idx])
+                risk = "moderate"
+                if depth > 1.0: risk = "critical"
+                elif depth > 0.6: risk = "severe"
+                elif depth > 0.3: risk = "high"
+                
+                await database.db.zones.update_one(
+                    {"zone_id": z["id"]},
+                    {"$set": {
+                        "depth_meters": round(depth, 2),
+                        "risk_level": risk,
+                        "prediction_timestamp": datetime.now(timezone.utc)
+                    }}
+                )
+
+                # Update Road Blocks in this zone
+                await database.db.road_blocks.update_many(
+                    {"zone_id": z["id"]},
+                    {"$set": {
+                        "depth_at_block": round(depth, 2),
+                        "reason": f"Automatic closure: {round(depth, 2)}m flooding",
+                        "status": "active" if depth > 0.3 else "cleared"
+                    }}
+                )
+
+                # Dynamically adjust Hospital Capacity based on flood depth
+                # (Simulate facility strain: deeper water = fewer available beds)
+                if depth > 0.1:
+                    strain = min(depth * 0.4, 0.8) # up to 80% capacity loss
+                    await database.db.hospital_capacity.update_many(
+                        {"zone_id": z["id"]},
+                        [{"$set": {
+                            "general_beds_available": { 
+                                "$floor": { "$multiply": ["$general_beds_total", max(0.1, 1.0 - strain)] } 
+                            },
+                            "emergency_beds_available": {
+                                "$floor": { "$multiply": ["$emergency_beds_total", max(0.1, 1.0 - strain)] }
+                            }
+                        }}]
+                    )
+        
+        # Generate a Global Alert for the whole basin if intensity is high
+        if req.intensity > 0.5:
+            await database.db.alerts.insert_one({
+                "alert_id": f"ALRT-{uuid.uuid4().hex[:4].upper()}",
+                "severity": "evacuation" if req.intensity > 0.8 else "warning",
+                "message": f"CRITICAL: {round(req.intensity*100)}% Storm intensity. Automated flood alerts active for KC Valley.",
+                "sent_at": datetime.now(timezone.utc),
+                "deleted_at": None,
+                "channel": "broadcast"
+            })
+
+        print(f"[Simulation] Updated {len(ZONES_MAPPING)} zones, road blocks, and hospital capacities in MongoDB")
+
+    roads = []
+    for u, v, edata in G.edges(data=True):
+        d_u = node_depths.get(u, 0.0)
+        d_v = node_depths.get(v, 0.0)
+        avg_depth = (d_u + d_v) / 2.0
+        roads.append({
+            "from": [float(G.nodes[u]['x']), float(G.nodes[u]['y'])],
+            "to":   [float(G.nodes[v]['x']), float(G.nodes[v]['y'])],
+            "depth": round(avg_depth, 2)
+        })
+
+    points = [{"lon": float(G.nodes[nodes[i]]['x']), "lat": float(G.nodes[nodes[i]]['y']), "depth": float(max_depths[i])} for i in range(num_nodes)]
+
+    timeline = []
+    for t in range(T):
+        timeline.append([round(float(all_depths[i, t]), 2) for i in range(num_nodes)])
+
+    return {"roads": roads, "points": points, "timeline": timeline, "provider": provider, "data_state": data_state}
+
+@stgcn_router.get("/api/providers/status")
+def get_provider_status():
+    status = provider_status()
+    return {
+        "stgcn": {"status": "available" if model is not None else "unavailable", "provider": "STGCN" if model is not None else "none"},
+        "prediction": {"status": "available", "provider": "STGCN" if model is not None else "SIMULATION", "data_state": "MODEL" if model is not None else "SIMULATED"},
+        "city": {"status": "available", "provider": "BUNDLED_OSM", "data_state": "CACHED"},
+        "weather": status["weather"],
+        "providers": status["providers"],
+        "providerHealth": provider_status_rows(),
+        "generatedAt": status["generatedAt"],
+    }
+
+
+@stgcn_router.get("/api/providers")
+def list_providers():
+    status = provider_status()
+    return {"providers": status["providers"], "generatedAt": status["generatedAt"]}
+
+
+@stgcn_router.get("/api/providers/health")
+def check_provider_health():
+    return {"providers": provider_status_rows(), "checkedAt": datetime.now(timezone.utc).isoformat()}
+
+
+@stgcn_router.get("/api/providers/government/data")
+def get_government_data(request: Request):
+    return fetch_government_resource(dict(request.query_params)).as_dict()
+
+
+@stgcn_router.get("/api/weather")
+def get_weather_provider_result():
+    return _weather_provider.fetch().as_dict()
+
+@stgcn_router.get("/weather")
+def get_weather():
+    result = _weather_provider.fetch()
+    return {
+        **result.data,
+        "status": result.freshness.lower(),
+        "freshness": result.freshness,
+        "source": result.source,
+        "confidence": result.confidence,
+        "retrieved_at": result.retrievedAt,
+        "fetched_at": result.retrievedAt,
+        "provenance": result.provenance,
+    }
+
+import math
+
+last_simulation_cache = {"intensity": None, "depth_lookup": {}}
+
+async def get_depth_lookup(intensity: float):
+    cached = last_simulation_cache
+    if cached["intensity"] == intensity and cached["depth_lookup"]:
+        return cached["depth_lookup"]
+        
+    if intensity <= 0.05:
+        last_simulation_cache["intensity"] = intensity
+        last_simulation_cache["depth_lookup"] = {}
+        return {}
+        
+    result = await simulate_storm(StormRequest(intensity=intensity))
+    flood_list = result["points"]
+    lookup = {nodes[i]: flood_list[i]["depth"] for i in range(len(flood_list))}
+    last_simulation_cache["intensity"] = intensity
+    last_simulation_cache["depth_lookup"] = lookup
+    return lookup
+
+def compute_flood_weight(length: float, depth_u: float, depth_v: float) -> float:
+    avg_depth_raw = (depth_u + depth_v) / 2.0
+    if avg_depth_raw > 0.3: # Impassable for almost all vehicles
+        return length + 999999.0
+    penalty = length * (math.exp(avg_depth_raw / 0.05) - 1.0)
+    return length + penalty
+
+def get_segment_color(avg_depth: float):
+    if avg_depth > 0.15:
+        return [255, 30, 50, 255]
+    elif avg_depth > 0.08:
+        return [255, 140, 0, 255]
+    elif avg_depth > 0.04:
+        return [255, 220, 0, 240]
+    else:
+        return [74, 222, 128, 255]
+
+def build_route_response(path, depth_lookup, G_routing):
+    segments = []
+    total_distance = 0.0
+    max_depth_on_route = 0.0
+
+    for i in range(len(path) - 1):
+        u, v = path[i], path[i + 1]
+        edge_keys = G_routing[u][v]
+        best_edge = min(edge_keys.values(), key=lambda d: d.get('flood_weight', float('inf')))
+        seg_length = float(best_edge.get('length', 0.0))
+        total_distance += seg_length
+
+        d_u = depth_lookup.get(u, 0.0)
+        d_v = depth_lookup.get(v, 0.0)
+        avg_depth = (d_u + d_v) / 2.0
+        max_depth_on_route = max(max_depth_on_route, avg_depth)
+
+        if 'geometry' in best_edge:
+            line_coords = list(best_edge['geometry'].coords)
+            start_node = (float(G.nodes[u]['x']), float(G.nodes[u]['y']))
+            first_geom = (line_coords[0][0], line_coords[0][1])
+            if abs(start_node[0] - first_geom[0]) + abs(start_node[1] - first_geom[1]) > 0.0001:
+                line_coords = line_coords[::-1]
+            coords = [[float(c[0]), float(c[1])] for c in line_coords]
+        else:
+            coords = [
+                [float(G.nodes[u]['x']), float(G.nodes[u]['y'])],
+                [float(G.nodes[v]['x']), float(G.nodes[v]['y'])]
+            ]
+
+        segments.append({
+            "path": coords,
+            "depth": round(avg_depth, 2),
+            "color": get_segment_color(avg_depth)
+        })
+
+    if max_depth_on_route > 0.15:
+        risk = "CRITICAL"
+    elif max_depth_on_route > 0.08:
+        risk = "HIGH"
+    elif max_depth_on_route > 0.04:
+        risk = "MODERATE"
+    else:
+        risk = "SAFE"
+
+    full_path = []
+    for i, seg in enumerate(segments):
+        if i == 0:
+            full_path.extend(seg["path"])
+        else:
+            full_path.extend(seg["path"][1:])
+
+    dist_km = round(total_distance / 1000.0, 2)
+
+    def compute_eta(base_speed_kmh, max_passable_depth):
+        if max_depth_on_route > (max_passable_depth / 100.0):
+            return None
+        flood_factor = max(1.0, 1.0 + (max_depth_on_route / (max_passable_depth / 100.0)) * 2.0)
+        effective_speed = base_speed_kmh / flood_factor
+        time_min = (dist_km / effective_speed) * 60
+        return round(time_min)
+
+    eta = {
+        "walk": compute_eta(5.0, 30.0), # 30cm limit
+        "bike": compute_eta(15.0, 8.0),  # 8cm limit
+        "car": compute_eta(30.0, 20.0), # 20cm limit
+    }
+
+    return {
+        "status": "success",
+        "path": full_path,
+        "segments": segments,
+        "distance_km": dist_km,
+        "max_depth": round(max_depth_on_route, 2),
+        "risk_level": risk,
+        "eta": eta,
+    }
+
+@stgcn_router.post("/route")
+async def get_route(req: RouteRequest):
+    depth_lookup = await get_depth_lookup(req.intensity)
+
+    orig = ox.distance.nearest_nodes(G, req.start_lon, req.start_lat)
+    dest = ox.distance.nearest_nodes(G, req.end_lon, req.end_lat)
+
+    # Fetch manual road blocks (barricades) from MongoDB
+    import database
+    blocked_nodes = set()
+    if database.db is not None:
+        cursor = database.db.road_blocks.find({"status": "active", "deleted_at": None})
+        async for rb in cursor:
+            if rb.get("node_id"):
+                blocked_nodes.add(rb["node_id"])
+
+    G_routing = G.copy()
+    for u, v, k, edata in G_routing.edges(keys=True, data=True):
+        length = float(edata.get('length', 1.0))
+        
+        # If either end of the edge is blocked by a barricade, make it impassable
+        if u in blocked_nodes or v in blocked_nodes:
+            edata['flood_weight'] = 9999999.0
+        else:
+            d_u = depth_lookup.get(u, 0.0)
+            d_v = depth_lookup.get(v, 0.0)
+            edata['flood_weight'] = compute_flood_weight(length, d_u, d_v)
+
+    try:
+        path = nx.dijkstra_path(G_routing, orig, dest, weight='flood_weight')
+        return build_route_response(path, depth_lookup, G_routing)
+    except nx.NetworkXNoPath:
+        return {"status": "error", "message": "No safe path found."}
+
+class NearestRequest(BaseModel):
+    lat: float
+    lon: float
+    facility_type: str
+    intensity: float
+
+FACILITY_COORDS = {
+    "hospital": [
+        (12.9199685, 77.6652549, "Manipal Hospitals"),
+        (12.9305937, 77.6186159, "St. Johns Emergency Ward"),
+        (12.9338175, 77.6201615, "Apollo Spectra Hospitals"),
+        (12.9166101, 77.6450517, "Phoenix Hospital"),
+        (12.9202359, 77.6674739, "Rainbow Childrens Hospital"),
+        (12.9587074, 77.6490296, "Manipal Hospital Bengaluru"),
+        (12.9191928, 77.6381223, "Greenview Hospital"),
+        (12.9503234, 77.6162619, "Govt Primary Health Centre"),
+        (12.9102142, 77.6244654, "Roopena Agrahara Govt Hospital"),
+        (12.9343279, 77.6228848, "HCG Koramangala"),
+    ],
+    "police": [
+        (12.9201775, 77.6513034, "HSR Police Station"),
+        (12.9410977, 77.6214106, "Koramangala Police Station"),
+        (12.9518683, 77.6223510, "Viveknagar Police Station"),
+        (12.9190149, 77.6679644, "Bellanduru Police Station"),
+        (12.9210124, 77.6206703, "Madiwala Traffic Police"),
+    ],
+    "fire": [
+        (12.9168126, 77.6738567, "Sarjapura Road Fire Station"),
+    ],
+    "shelter": [
+        (12.9215585, 77.6441635, "HSR Layout Shelter"),
+        (12.9110130, 77.6411318, "Agara Shelter A"),
+        (12.9111180, 77.6402540, "Agara Shelter B"),
+        (12.9190637, 77.6387847, "Iblur Shelter"),
+    ],
+}
+
+@stgcn_router.post("/route/nearest")
+async def get_nearest_route(req: NearestRequest):
+    facilities = FACILITY_COORDS.get(req.facility_type, FACILITY_COORDS["hospital"])
+    depth_lookup = await get_depth_lookup(req.intensity)
+
+    best_route = None
+    best_name = ""
+
+    for f_lat, f_lon, f_name in facilities:
+        f_depth = 0.0
+        nearest_f_node = ox.distance.nearest_nodes(G, f_lon, f_lat)
+        f_depth = depth_lookup.get(nearest_f_node, 0.0)
+        if f_depth > 10:
+            continue
+
+        orig = ox.distance.nearest_nodes(G, req.lon, req.lat)
+        dest = nearest_f_node
+
+        # Fetch manual road blocks (barricades) from MongoDB
+        import database
+        blocked_nodes = set()
+        if database.db is not None:
+            cursor = database.db.road_blocks.find({"status": "active", "deleted_at": None})
+            async for rb in cursor:
+                if rb.get("node_id"):
+                    blocked_nodes.add(rb["node_id"])
+
+        G_routing = G.copy()
+        for u, v, k, edata in G_routing.edges(keys=True, data=True):
+            length = float(edata.get('length', 1.0))
+            if u in blocked_nodes or v in blocked_nodes:
+                edata['flood_weight'] = 9999999.0
+            else:
+                d_u = depth_lookup.get(u, 0.0)
+                d_v = depth_lookup.get(v, 0.0)
+                edata['flood_weight'] = compute_flood_weight(length, d_u, d_v)
+
+        try:
+            path = nx.dijkstra_path(G_routing, orig, dest, weight='flood_weight')
+            route = build_route_response(path, depth_lookup, G_routing)
+            if best_route is None or route["distance_km"] < best_route["distance_km"]:
+                best_route = route
+                best_name = f_name
+        except nx.NetworkXNoPath:
+            continue
+
+    if best_route:
+        best_route["facility_name"] = best_name
+        return best_route
+    return {"status": "error", "message": f"No accessible {req.facility_type} found."}
+
+# Include router on this app (for standalone `python api.py` usage)
+app.include_router(stgcn_router)
+
+if __name__ == "__main__":
+    import uvicorn
+    print("=" * 60)
+    print("WARNING: Running api.py directly only starts STGCN routes.")
+    print("         MongoDB CRUD routes will NOT be available!")
+    print("         Use 'python main.py' for the full unified server.")
+    print("=" * 60)
+    host = os.getenv("API_HOST", "0.0.0.0")
+    port = int(os.getenv("API_PORT", 8000))
+    uvicorn.run(app, host=host, port=port)
+

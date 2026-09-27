@@ -1,0 +1,13 @@
+.env
+.env.*
+!.env.example
+**/venv/
+**/.venv/
+**/node_modules/
+**/__pycache__/
+**/*.py[cod]
+**/dist/
+**/.pytest_cache/
+**/*.log
+backend/*.pt
+backend/model_artifacts/
